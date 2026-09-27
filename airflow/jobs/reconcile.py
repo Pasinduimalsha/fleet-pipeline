@@ -23,7 +23,10 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-pd.set_option("future.no_silent_downcasting", True)
+try:  # option only exists on pandas >= 2.2; harmless to skip on older/newer pandas
+    pd.set_option("future.no_silent_downcasting", True)
+except pd.errors.OptionError:
+    pass
 
 from common.config import settings
 from common.db import fetch_all, fetch_one, get_connection, mark_heartbeat, upsert_rows
@@ -188,10 +191,24 @@ def compute_consistency_check(conn, day: int) -> dict:
         "FROM daily_profitability WHERE sim_day = %s",
         (day,),
     )
+    # rt_fleet_metrics holds a 5-minute/1-minute SLIDING window per row, so
+    # every event is counted in up to 5 overlapping windows -- summing all
+    # rows for the day would inflate the speed-layer total ~5x. Keep only
+    # the non-overlapping subset (window_start aligned to a multiple of the
+    # window span), which recovers an exact tumbling partition of the day
+    # with no double counting. Requires the window span to evenly divide
+    # SIM_DAY_SECONDS, true for the shipped 5-minute-window/300s-day default.
     speed = fetch_one(
         conn,
-        "SELECT COALESCE(SUM(trips_completed),0) AS trips, COALESCE(SUM(earnings),0) AS earnings "
-        "FROM rt_fleet_metrics WHERE sim_day = %s",
+        """
+        SELECT COALESCE(SUM(trips_completed), 0) AS trips, COALESCE(SUM(earnings), 0) AS earnings
+        FROM rt_fleet_metrics
+        WHERE sim_day = %s
+          AND MOD(
+                EXTRACT(EPOCH FROM window_start)::bigint,
+                EXTRACT(EPOCH FROM (window_end - window_start))::bigint
+              ) = 0
+        """,
         (day,),
     )
     batch_trips, batch_earnings = int(batch["trips"]), float(batch["earnings"])

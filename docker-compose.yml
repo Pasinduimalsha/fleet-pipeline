@@ -12,7 +12,10 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
     AIRFLOW__METRICS__STATSD_ON: "false"
-    PYTHONPATH: /opt/airflow:/opt/airflow/common
+    # NOTE: do not also add /opt/airflow/common here -- that would put
+    # common/ directly on sys.path, and common/logging.py would then shadow
+    # the stdlib `logging` module (circular import crash on startup).
+    PYTHONPATH: /opt/airflow
     # Pipeline settings shared with the DAG / reconcile job
     SIM_DAY_SECONDS: ${SIM_DAY_SECONDS}
     FLEET_DB_HOST: postgres

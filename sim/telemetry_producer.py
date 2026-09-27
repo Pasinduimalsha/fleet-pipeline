@@ -76,11 +76,13 @@ class VehicleAgent:
         now = time.monotonic()
         trip_completed = False
         fare = 0.0
+        event_trip_id = self.trip_id
 
         if now >= self.state_until:
             if self.status == "idle":
                 self.status = "enroute"
                 self.trip_id = str(uuid.uuid4())
+                event_trip_id = self.trip_id
                 self.distance_this_trip = 0.0
                 self._maybe_switch_zone()
                 self.state_until = now + random.uniform(*ENROUTE_SECONDS)
@@ -90,6 +92,7 @@ class VehicleAgent:
             elif self.status == "on_trip":
                 fare = round(BASE_FARE + RATE_PER_KM * self.distance_this_trip, 2)
                 trip_completed = True
+                event_trip_id = self.trip_id  # the trip that just finished, not yet cleared
                 self.status = "idle"
                 self.trip_id = None
                 if random.random() < STUCK_VEHICLE_RATE:
@@ -109,7 +112,7 @@ class VehicleAgent:
             self.distance_this_trip += speed * (settings.event_interval_seconds / 3600.0)
 
         return {
-            "trip_id": self.trip_id,
+            "trip_id": event_trip_id,
             "driver_id": self.driver_id,
             "vehicle_id": self.vehicle_id,
             "zone": self.zone,

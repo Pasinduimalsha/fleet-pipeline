@@ -22,6 +22,11 @@ def test_vehicle_lifecycle_eventually_completes_a_trip():
         if event["trip_completed"]:
             saw_trip_completed = True
             assert event["fare"] > 0
+            # Regression: trip_id must still be set on the completion event
+            # itself (it used to be cleared before the event was built, so
+            # summarize_trips()'s count("trip_id") silently dropped every
+            # completed trip).
+            assert event["trip_id"] is not None
             break
     assert saw_trip_completed
 
