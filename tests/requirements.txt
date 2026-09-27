@@ -1,0 +1,6 @@
+pytest==8.3.3
+pandas==2.2.3
+psycopg2-binary==2.9.9
+kafka-python==2.0.2
+structlog==24.4.0
+prometheus-client==0.21.0

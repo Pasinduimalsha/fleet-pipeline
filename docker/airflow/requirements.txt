@@ -1,0 +1,6 @@
+pyspark==3.5.3
+psycopg2-binary
+structlog==24.4.0
+prometheus-client==0.21.0
+pandas
+pyarrow

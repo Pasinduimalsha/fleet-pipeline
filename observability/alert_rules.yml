@@ -1,0 +1,24 @@
+# Alert rules. Metric names are the contract for the services built later.
+groups:
+  - name: pipeline-health
+    rules:
+      - alert: NoDataReceived
+        expr: fleet_seconds_since_last_event > 60
+        for: 15s
+        labels: { severity: critical }
+        annotations:
+          summary: "No telemetry events reached the pipeline for over 60s"
+
+      - alert: HighInvalidRecordRate
+        expr: rate(fleet_invalid_records_total[1m]) / clamp_min(rate(fleet_records_total[1m]), 1e-9) > 0.05
+        for: 30s
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 5% of incoming records are invalid"
+
+      - alert: BatchReconciliationStale
+        expr: fleet_seconds_since_last_batch_success > 900
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "Daily reconciliation has not succeeded for over 3 simulated days"

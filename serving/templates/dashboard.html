@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Fleet Operations Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background: #0b0f14; color: #e6edf3; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .sub { color: #8b949e; font-size: 0.85rem; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px 16px; }
+  .card .label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.03em; }
+  .card .value { font-size: 1.6rem; font-weight: 600; margin-top: 4px; }
+  section { margin-bottom: 28px; }
+  h2 { font-size: 1.05rem; border-bottom: 1px solid #30363d; padding-bottom: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; }
+  .status-ok { color: #3fb950; }
+  .status-degraded, .status-stale { color: #f85149; }
+  .status-healthy { color: #3fb950; }
+  .neg { color: #f85149; }
+  .pos { color: #3fb950; }
+  #updated { color: #8b949e; font-size: 0.75rem; }
+</style>
+</head>
+<body>
+  <h1>Fleet Operations Dashboard</h1>
+  <div class="sub">Live fleet utilization (speed layer) + daily profitability reconciliation (batch layer). <span id="updated"></span></div>
+
+  <div class="grid" id="fleet-cards"></div>
+
+  <section>
+    <h2>Pipeline health</h2>
+    <table id="health-table"><thead><tr><th>Component</th><th>Status</th><th>Seconds since last success</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>Utilization &amp; earnings by zone</h2>
+    <table id="zone-table">
+      <thead><tr><th>Zone</th><th>Active</th><th>Idle</th><th>Idle ratio</th><th>Trips (window)</th><th>Earnings (window)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Active idle-vehicle alerts</h2>
+    <table id="alerts-table"><thead><tr><th>Vehicle</th><th>Message</th><th>Created</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>Daily profitability reconciliation</h2>
+    <div class="sub" id="profitability-day"></div>
+    <table id="profit-table">
+      <thead><tr><th>Vehicle</th><th>Trips</th><th>Earnings</th><th>Fuel</th><th>Maintenance</th><th>Profit</th><th>Cost/km</th><th>Has expenses</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+<script>
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  return r.json();
+}
+function fmt(n) { return (n === null || n === undefined || Number.isNaN(n)) ? "n/a" : Number(n).toFixed(2); }
+
+async function refresh() {
+  const [fleet, zones, health, alertsData, days] = await Promise.all([
+    getJSON("/metrics/fleet"),
+    getJSON("/metrics/zones"),
+    getJSON("/health"),
+    getJSON("/alerts?limit=15"),
+    getJSON("/reports/profitability/days"),
+  ]);
+
+  const cards = document.getElementById("fleet-cards");
+  if (fleet) {
+    cards.innerHTML = `
+      <div class="card"><div class="label">Active vehicles</div><div class="value">${fleet.active_vehicles ?? "-"}</div></div>
+      <div class="card"><div class="label">Idle vehicles</div><div class="value">${fleet.idle_vehicles ?? "-"}</div></div>
+      <div class="card"><div class="label">Idle ratio</div><div class="value">${fmt((fleet.idle_ratio ?? 0) * 100)}%</div></div>
+      <div class="card"><div class="label">Trips (window)</div><div class="value">${fleet.trips_completed ?? "-"}</div></div>
+      <div class="card"><div class="label">Earnings (window)</div><div class="value">$${fmt(fleet.earnings)}</div></div>
+    `;
+  } else {
+    cards.innerHTML = `<div class="card"><div class="label">Fleet metrics</div><div class="value">waiting for data...</div></div>`;
+  }
+
+  if (health) {
+    const tbody = document.querySelector("#health-table tbody");
+    tbody.innerHTML = Object.entries(health.components).map(([name, c]) => `
+      <tr><td>${name}</td><td class="status-${c.status}">${c.status}</td><td>${fmt(c.seconds_since_last_success)}</td></tr>
+    `).join("");
+  }
+
+  if (zones && zones.zones) {
+    const tbody = document.querySelector("#zone-table tbody");
+    tbody.innerHTML = zones.zones.map(z => `
+      <tr><td>${z.zone}</td><td>${z.active_vehicles}</td><td>${z.idle_vehicles}</td>
+      <td>${fmt((z.idle_ratio ?? 0) * 100)}%</td><td>${z.trips_completed}</td><td>$${fmt(z.earnings)}</td></tr>
+    `).join("");
+  }
+
+  if (alertsData && alertsData.alerts) {
+    const tbody = document.querySelector("#alerts-table tbody");
+    tbody.innerHTML = alertsData.alerts.length
+      ? alertsData.alerts.map(a => `<tr><td>${a.vehicle_id ?? ""}</td><td>${a.message}</td><td>${new Date(a.created_at).toLocaleTimeString()}</td></tr>`).join("")
+      : `<tr><td colspan="3">No active alerts</td></tr>`;
+  }
+
+  if (days && days.sim_days && days.sim_days.length) {
+    const latestDay = days.sim_days[0];
+    const profit = await getJSON(`/reports/profitability?sim_day=${latestDay}`);
+    document.getElementById("profitability-day").textContent = `Sim day ${latestDay}` +
+      (profit && profit.consistency_check ? ` -- speed vs batch earnings delta: ${fmt(profit.consistency_check.earnings_delta_pct)}%` : "");
+    if (profit && profit.vehicles) {
+      const tbody = document.querySelector("#profit-table tbody");
+      tbody.innerHTML = profit.vehicles.map(v => `
+        <tr>
+          <td>${v.vehicle_id}</td><td>${v.trips}</td><td>$${fmt(v.earnings)}</td>
+          <td>$${fmt(v.fuel_cost)}</td><td>$${fmt(v.maintenance_cost)}</td>
+          <td class="${(v.profit ?? 0) < 0 ? 'neg' : 'pos'}">$${fmt(v.profit)}</td>
+          <td>$${fmt(v.cost_per_km)}</td><td>${v.has_expenses}</td>
+        </tr>
+      `).join("");
+    }
+  } else {
+    document.getElementById("profitability-day").textContent = "No reconciliation has run yet.";
+  }
+
+  document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

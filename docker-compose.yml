@@ -1,0 +1,267 @@
+# Fleet Operations pipeline.
+# Memory budget: keep Docker Desktop at >= 6 GB (Kafka + Spark + Airflow + Postgres + Prometheus/Grafana).
+
+x-airflow-common: &airflow-common
+  build: ./docker/airflow
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${AIRFLOW_DB}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    AIRFLOW__METRICS__STATSD_ON: "false"
+    PYTHONPATH: /opt/airflow:/opt/airflow/common
+    # Pipeline settings shared with the DAG / reconcile job
+    SIM_DAY_SECONDS: ${SIM_DAY_SECONDS}
+    FLEET_DB_HOST: postgres
+    FLEET_DB_NAME: ${POSTGRES_DB}
+    FLEET_DB_USER: ${POSTGRES_USER}
+    FLEET_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    LAKE_PATH: /data/lake
+    LANDING_PATH: /data/landing
+    REPORTS_PATH: /reports
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/jobs:/opt/airflow/jobs
+    - ./airflow/logs:/opt/airflow/logs
+    - ./common:/opt/airflow/common
+    - ./data:/data
+    - ./reports:/reports
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+x-app-common: &app-common
+  environment: &app-env
+    SIM_DAY_SECONDS: ${SIM_DAY_SECONDS}
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_TOPIC: ${KAFKA_TOPIC}
+    KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC}
+    FLEET_DB_HOST: postgres
+    FLEET_DB_NAME: ${POSTGRES_DB}
+    FLEET_DB_USER: ${POSTGRES_USER}
+    FLEET_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    LAKE_PATH: /data/lake
+    LANDING_PATH: /data/landing
+    CHECKPOINTS_PATH: /data/checkpoints
+    REPORTS_PATH: /reports
+    NUM_VEHICLES: ${NUM_VEHICLES:-40}
+    EVENT_INTERVAL_SECONDS: ${EVENT_INTERVAL_SECONDS:-3}
+    IDLE_ALERT_MINUTES: ${IDLE_ALERT_MINUTES:-3}
+    MALFORMED_EVENT_RATE: ${MALFORMED_EVENT_RATE:-0.02}
+    PYTHONPATH: /app
+  volumes:
+    - ./common:/app/common
+    - ./data:/data
+    - ./reports:/reports
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka-init:
+      condition: service_completed_successfully
+
+services:
+  # ---------------------------------------------------------------- Ingestion
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: fleet-kafka
+    ports:
+      - "29092:29092" # host access for local debugging
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # One-shot: create topics with explicit partition counts.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: fleet-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        T=/opt/kafka/bin/kafka-topics.sh
+        $$T --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_TOPIC} --partitions ${KAFKA_PARTITIONS} --replication-factor 1
+        $$T --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_DLQ_TOPIC} --partitions 1 --replication-factor 1
+        $$T --bootstrap-server kafka:9092 --describe
+
+  # Streaming data source: per-vehicle GPS/telemetry events.
+  stream-sim:
+    <<: *app-common
+    build: ./docker/sim
+    container_name: fleet-stream-sim
+    command: ["python", "-m", "sim.telemetry_producer"]
+    environment:
+      <<: *app-env
+      METRICS_PORT_PRODUCER: 8001
+    volumes:
+      - ./common:/app/common
+      - ./sim:/app/sim
+
+  # Daily-batch data source: one vehicle-expense CSV per simulated day.
+  batch-sim:
+    <<: *app-common
+    build: ./docker/sim
+    container_name: fleet-batch-sim
+    command: ["python", "-m", "sim.expense_generator"]
+    volumes:
+      - ./common:/app/common
+      - ./sim:/app/sim
+      - ./data:/data
+
+  # ---------------------------------------------------------------- Storage
+  postgres:
+    image: postgres:16
+    container_name: fleet-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      AIRFLOW_DB: ${AIRFLOW_DB}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5434}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./sql/00_create_airflow_db.sh:/docker-entrypoint-initdb.d/00_create_airflow_db.sh:ro
+      - ./sql/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------- Orchestration
+  airflow-init:
+    <<: *airflow-common
+    container_name: fleet-airflow-init
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        airflow db migrate
+        airflow users create --username ${AIRFLOW_ADMIN_USER} --password ${AIRFLOW_ADMIN_PASSWORD} \
+          --firstname Admin --lastname User --role Admin --email admin@example.com || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: fleet-airflow-web
+    command: webserver
+    ports:
+      - "${AIRFLOW_HOST_PORT:-8088}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: fleet-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------- Processing (speed layer)
+  streaming:
+    <<: *app-common
+    build: ./docker/streaming
+    container_name: fleet-streaming
+    environment:
+      <<: *app-env
+      METRICS_PORT_STREAMING: 8002
+      HOME: /root
+    command:
+      - spark-submit
+      - --master
+      - local[*]
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+      - --conf
+      - spark.jars.ivy=/root/.ivy2
+      - /app/streaming/stream_job.py
+    volumes:
+      - ./common:/app/common
+      - ./streaming:/app/streaming
+      - ./data:/data
+      - spark-ivy:/root/.ivy2
+
+  # ---------------------------------------------------------------- Serving
+  api:
+    <<: *app-common
+    build: ./docker/serving
+    container_name: fleet-api
+    command: ["uvicorn", "serving.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    volumes:
+      - ./common:/app/common
+      - ./serving:/app/serving
+
+  # ---------------------------------------------------------------- Observability
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: fleet-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prom-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: fleet-grafana
+    ports:
+      - "${GRAFANA_HOST_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - postgres
+
+volumes:
+  kafka-data:
+  pg-data:
+  prom-data:
+  grafana-data:
+  spark-ivy:
