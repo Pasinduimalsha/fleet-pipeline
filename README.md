@@ -8,144 +8,53 @@ reconciliation once the previous day's fuel/maintenance costs land.
 
 ## Architecture
 
-```
-                    ┌──────────────────┐
- sim/               │ stream-sim       │  GPS/telemetry events, every 3s/vehicle
- telemetry_producer  │ (Kafka producer) │  (~2% deliberately malformed)
-                    └────────┬─────────┘
-                             │ trips.telemetry
-                             ▼
-                    ┌──────────────────┐        ┌─────────────────┐
-                    │  Kafka           │───────▶│  streaming       │  SPEED LAYER
-                    │  (3 partitions)  │ dlq    │  (Spark          │  (Structured
-                    └──────────────────┘◀───────│  Structured      │   Streaming,
-                                                 │  Streaming)      │   4 queries)
-                                                 └────────┬─────────┘
-                                                          │
-                             ┌────────────────────────────┼─────────────────────┐
-                             ▼                             ▼                     ▼
-                   rt_zone_metrics /              vehicle_state /        data/lake/raw_events
-                   rt_fleet_metrics                  alerts              (Parquet, sim_day=N)
-                   (5-min/1-min windows)         (idle-vehicle alert)     for batch replay
-                             │                             │                     │
-                             └─────────────┬───────────────┘                     │
-                                            ▼                                    │
-                                     ┌──────────────┐                            │
-                                     │  Postgres    │◀───────────────────────────┘
-                                     │  (serving DB)│         (read by Airflow)
-                                     └──────┬───────┘
-                                            │
-                    ┌───────────────────────┼────────────────────────┐
-                    ▼                                                 ▼
-            ┌──────────────┐                                ┌─────────────────┐
-            │  serving/api │  FastAPI + dashboard            │  Airflow DAG     │  BATCH LAYER
-            │  :8000       │  (live utilization, alerts,     │  daily_fleet_    │  (reconcile
-            └──────────────┘   daily profitability report)   │  reconciliation  │   expenses vs.
-                                                               └────────┬─────────┘   trip totals)
-                                                                        ▲
-                                                               ┌────────┴─────────┐
-                                                               │  batch-sim       │  one CSV/
-                                                               │  (expense        │  simulated day
-                                                               │  generator)      │
-                                                               └──────────────────┘
-```
+![Architecture diagram](docs/architecture-diagram.png)
 
-## Why Lambda, not Kappa
-
-The use case genuinely needs two different processing semantics operating on
-two different arrival cadences:
-
-- **Speed layer** (continuous, approximate, windowed): "what's happening
-  right now" -- active/idle vehicles, trips/hour, earnings by zone. Low
-  latency matters here; a few seconds of staleness is fine, exactness is not
-  required (`approx_count_distinct`, 1-minute sliding windows).
-- **Batch layer** (once/day, exact, replayable): per-vehicle profitability
-  once fuel/maintenance costs land. This must reconcile against a
-  *second, independently-arriving source* (the expense feed) that a pure
-  streaming join can't wait indefinitely for, and it must be exactly
-  reproducible/auditable (finance-adjacent numbers), which favors a
-  recompute-from-source batch job over incremental streaming state.
-
-A Kappa architecture (single streaming pipeline, batch = replay) was
-considered and rejected: it would force the daily join against a
-once-a-day file through the same streaming engine, which either means
-holding an all-day streaming state waiting for a file that arrives once, or
-re-deriving a second "batch-shaped" path anyway inside the stream job --
-at that point it's a Lambda architecture with extra steps. Lambda's
-speed/batch split maps directly onto the two data sources this use case
-actually has (continuous telemetry vs. once-daily expense file), and the
-`consistency_checks` table (speed-layer totals vs. batch-layer totals per
-sim day) turns the classic Lambda "two codepaths can drift" risk into an
-observable, queryable metric instead of a hidden assumption.
-
-**Trade-off accepted:** duplicated aggregation logic between the speed
-layer's windowed trip/earnings totals and the batch layer's exact recompute
-from the Parquet lake. This is exactly the trade-off Lambda architectures
-are known for; the `consistency_checks` table and `/reports/profitability`
-endpoint's `consistency_check` field make the drift visible rather than
-letting it hide.
-
-## Technology stack
-
-| Layer | Choice | Why |
-|---|---|---|
-| Ingestion | Apache Kafka (3 partitions, keyed by `vehicle_id`) | Required by the brief; partitioning by vehicle preserves per-vehicle event order, which the idle-alert state machine depends on. |
-| Stream processing | Apache Spark Structured Streaming (`local[*]`, 4 concurrent queries) | Required by the brief; native windowed aggregation (`groupBy(window(...))`) and arbitrary stateful aggregation (`groupBy` + `max_by`) cover both the windowed-metrics and latest-vehicle-state needs without hand-rolled state management. `local[*]` is a deliberate scale choice -- see Limitations. |
-| Batch orchestration | Apache Airflow (`schedule=timedelta(seconds=SIM_DAY_SECONDS)`) | Required by the brief; TaskFlow DAG with a `PythonSensor` waiting for the day's file, then load → compute → consistency-check → report as separate, independently retryable tasks. |
-| Batch compute | pandas (not Spark) inside the Airflow task | One sim day's trip volume for a class-scale fleet is a few thousand rows -- a JVM/Spark cluster would add operational weight without a throughput benefit at this scale. Documented as a production-scale trade-off below. |
-| Storage / serving | PostgreSQL | Both layers write structured, queryable rows (metrics, alerts, profitability); a relational store with upserts (`ON CONFLICT DO UPDATE`) gives idempotent writes for free under Spark micro-batch retries and Airflow task retries, and lets the API/Grafana query with plain SQL. |
-| Raw event archive | Parquet on a local volume (`data/lake/raw_events/sim_day=N/`), partitioned by sim day | Gives the batch layer an authoritative, replayable source independent of the speed layer's windowed approximations -- the actual Lambda "batch reprocesses raw data" property. |
-| Serving API | FastAPI + a small static dashboard | Lightweight, typed, auto-docs (`/docs`), easy to add Prometheus instrumentation to. |
-| Observability | Prometheus + Grafana + structlog (JSON logs) | Required by the brief; `structlog` gives every log line a `component` field across ingestion/processing/storage stages; Prometheus alert rules cover the "no data in N minutes" and "error rate" requirements explicitly. |
-
-## Observability
-
-- **Structured logging**: every component (`producer`, `streaming`,
-  `batch_sim`, `batch_reconcile`, `api`) logs JSON lines via `structlog`
-  bound with a `component` field (`common/logging.py`).
-- **Metrics** (`observability/prometheus.yml` scrapes 3 targets + itself):
-  - `stream-sim:8001` -- `fleet_records_total`, `fleet_invalid_records_total`
-    (events produced / deliberately malformed).
-  - `streaming:8002` -- `fleet_records_total`, `fleet_invalid_records_total`
-    (events actually consumed/rejected), `fleet_seconds_since_last_event`
-    (climbs continuously between batches via a background thread, so it
-    reflects true staleness, not just the last micro-batch tick).
-  - `api:8000` -- `fleet_seconds_since_last_batch_success` (computed live
-    from `pipeline_status` at scrape time), plus request count/latency.
-- **Alert rules** (`observability/alert_rules.yml`, loaded by Prometheus):
-  - `NoDataReceived`: `fleet_seconds_since_last_event > 60` for 15s.
-  - `HighInvalidRecordRate`: invalid/total ratio > 5% for 30s.
-  - `BatchReconciliationStale`: no successful daily reconciliation for 3
-    simulated days.
-- **Health-check endpoint**: `GET /health` on the API cross-checks
-  `pipeline_status` against per-component staleness thresholds and reports
-  `ok`/`degraded` -- the same signal Prometheus uses, exposed for a
-  human/demo audience.
-- **Business-level alerting**: the streaming job raises a `VEHICLE_IDLE`
-  row in the `alerts` table once a vehicle has been idle past
-  `IDLE_ALERT_MINUTES`, deduplicated per idle episode via a unique index
-  on `(alert_type, vehicle_id, message)`.
-
-## Simulated clock
-
-One simulated day = `SIM_DAY_SECONDS` real seconds (default **300s = 5
-minutes**). Every component derives `sim_day`/`sim_hour` independently from
-`common/simclock.py`, using UTC midnight of the day the stack starts as
-day 0 -- no coordination service needed, since every container computes
-the same value within moments of each other at startup. Because 5 minutes
-compresses a full day, `sim_day` climbs quickly (e.g. by ~90 within the
-first 7.5 real hours after midnight UTC); for a crisp "day 0" demo start,
-set `SIM_EPOCH` in `.env` to the current UTC timestamp right before you
-bring the stack up:
-
-```bash
-echo "SIM_EPOCH=$(date -u +%Y-%m-%dT%H:%M:%S)" >> .env
-```
+Continuous GPS/telemetry events flow through Kafka into a Spark Structured
+Streaming speed layer, which writes windowed utilization/earnings metrics,
+vehicle state, and alerts to Postgres, and archives raw events to a Parquet
+lake. Independently, a once-daily expense file feeds an Airflow batch layer
+that recomputes exact per-vehicle profitability from that same Parquet
+lake and cross-checks it against the speed layer's totals. Both layers
+converge on Postgres, served through a FastAPI service and dashboard, and
+scraped by Prometheus/Grafana for observability. The full architecture
+decision (Lambda vs. Kappa), technology-stack justification, and
+observability design are covered in the project report.
 
 ## Running it
 
 Requires Docker Desktop with **>= 6 GB** memory (Kafka + Spark + Airflow +
 Postgres + Prometheus/Grafana all run locally).
+
+### Quick start
+
+```bash
+cp .env.example .env      # first time only
+docker compose up -d --build
+docker compose ps         # wait until everything is healthy
+```
+
+### Bringing up services individually
+
+Each service can also be started, stopped, or restarted on its own, which
+is useful for demos (e.g. stopping the producer to trigger the
+`NoDataReceived` alert) or for debugging one layer at a time:
+
+```bash
+docker compose up -d postgres kafka          # storage + broker first
+docker compose up -d kafka-init              # creates the Kafka topics
+docker compose up -d streaming stream-sim    # speed layer
+docker compose up -d batch-sim airflow-init airflow-webserver airflow-scheduler  # batch layer
+docker compose up -d api prometheus grafana  # serving + observability
+
+docker compose stop stream-sim               # e.g. simulate a producer outage
+docker compose logs -f streaming             # tail one service's logs
+docker compose restart streaming             # restart just the streaming job
+```
+
+### Makefile shortcuts
+
+A `Makefile` wraps the common Docker Compose commands:
 
 ```bash
 make up        # creates .env from .env.example if missing, builds, starts everything
@@ -158,8 +67,18 @@ make reset     # stop + wipe volumes and generated data/reports
 ```
 
 First `spark-submit` invocation downloads the `spark-sql-kafka` connector
-jars via Maven (`--packages`, cached in the `spark-ivy` volume across
-restarts) -- this needs internet access the first time only.
+jars via Maven, cached across restarts -- this needs internet access the
+first time only.
+
+One simulated day compresses to `SIM_DAY_SECONDS` real seconds (default
+300s = 5 minutes), so a full daily ingest/reconcile cycle can be observed
+within a single demo session. For a crisp "day 0" start right before a
+demo, pin the epoch to now:
+
+```bash
+echo "SIM_EPOCH=$(date -u +%Y-%m-%dT%H:%M:%S)" >> .env
+docker compose down && docker compose up -d
+```
 
 ### URLs
 
@@ -171,7 +90,67 @@ restarts) -- this needs internet access the first time only.
 | Prometheus | http://localhost:9090 | Targets: Status -> Targets |
 | Grafana | http://localhost:3001 | admin/admin; Postgres + Prometheus datasources pre-provisioned |
 
-### Key API endpoints
+### Trade-offs and what would change at production scale
+
+- **Spark runs in `local[*]` mode**, not a real cluster. Correct choice at
+  this data volume (one class-scale fleet), but at production scale you'd
+  run on YARN/Kubernetes with autoscaling executors, and would need to
+  revisit the driver-collects Postgres sink pattern used here (fine for a
+  few hundred rows/micro-batch; would need a partitioned JDBC write or a
+  proper sink connector at higher volume).
+- **Batch reconciliation uses pandas, not Spark**, deliberately. At real
+  fleet scale (thousands of vehicles, millions of trips/day) this would
+  move to the same Spark cluster as the speed layer.
+- **Idle-vehicle alerting is per-micro-batch stateful logic in Python**,
+  not Spark's built-in state-store API. Simpler to reason about and test at
+  this scale; would not scale past a single-partition bottleneck on
+  vehicle-state writes.
+- **No exactly-once guarantee end-to-end.** Postgres upserts make the sinks
+  idempotent under replay/retry, but a crash between a Kafka commit and the
+  Postgres write can still double-process a micro-batch's *effects*
+  (harmless here since upserts overwrite, but would matter for e.g.
+  billing).
+- **Single-broker Kafka, single-node Postgres.** No replication; acceptable
+  for a 2-week class project, not for production availability.
+- **Vehicle roster and zone geography are synthetic**; a real deployment
+  would source these from a fleet-management system.
+- **Malformed-event injection is coarse** (~2% of events, three corruption
+  modes). Good enough to exercise the DLQ path; not a substitute for a real
+  schema-registry-enforced contract.
+
+### How to reproduce the results
+
+1. Bring up the stack (`make up` or `docker compose up -d --build`) and
+   wait for `docker compose ps` to show everything healthy.
+2. Open the dashboard at http://localhost:8000/ -- active/idle vehicles,
+   earnings by zone, and pipeline health should populate within a few
+   seconds.
+3. Hit the live endpoints directly:
+   ```bash
+   curl -s localhost:8000/health | jq
+   curl -s localhost:8000/metrics/fleet | jq
+   curl -s localhost:8000/metrics/zones | jq
+   curl -s localhost:8000/alerts | jq
+   ```
+4. Wait for at least one `SIM_DAY_SECONDS` interval (5 minutes by default)
+   for the Airflow DAG's first run, then fetch the daily reconciliation
+   report:
+   ```bash
+   curl -s "localhost:8000/reports/profitability?sim_day=0" | jq
+   ```
+   The same report is also written to `reports/daily_profitability_day_0.md`.
+5. To reproduce the alerting behaviour shown in the report, stop the
+   producer and watch Prometheus flag it:
+   ```bash
+   docker compose stop stream-sim
+   ```
+   Open http://localhost:9090/alerts -- `NoDataReceived` goes
+   pending, then firing, within ~75 seconds. Restart with
+   `docker compose start stream-sim` to see it self-heal.
+6. Open Grafana (http://localhost:3001) to see the same metrics visualized
+   on the pre-provisioned "Fleet" dashboard.
+
+## Key API endpoints
 
 - `GET /metrics/fleet`, `GET /metrics/zones` -- live utilization (business
   question: "what is fleet utilization and earnings by area/time-of-day
@@ -187,49 +166,6 @@ restarts) -- this needs internet access the first time only.
 The same daily report is also written to `reports/daily_profitability_day_N.md`
 by the Airflow DAG (the "scheduled report file" deliverable, independent of
 the live dashboard).
-
-## Repository layout
-
-```
-common/       shared config, structured logging, DB helpers, metrics, sim clock, fleet/zone model
-sim/          simulated data sources: telemetry_producer.py (streaming), expense_generator.py (daily batch)
-streaming/    Spark Structured Streaming speed layer (stream_job.py)
-airflow/      dags/ (DAG definition) + jobs/reconcile.py (pure, testable batch logic)
-serving/      FastAPI serving layer + dashboard.html
-sql/          Postgres schema (idempotent upserts throughout)
-observability/ Prometheus scrape/alert config, Grafana provisioning
-docker/       per-service Dockerfiles
-tests/        pytest unit tests for the pure-logic pieces (no Docker required)
-```
-
-## Limitations, trade-offs, and what would change at production scale
-
-- **Spark runs in `local[*]` mode**, not a real cluster. Correct choice at
-  this data volume (one class-scale fleet), but at production scale you'd
-  run on YARN/Kubernetes with autoscaling executors, and would need to
-  revisit the `foreachBatch`-collects-to-driver pattern used for the
-  Postgres sinks (fine for a few hundred rows/micro-batch here; would need
-  a partitioned JDBC write or a proper sink connector at higher volume).
-- **Batch reconciliation uses pandas, not Spark**, deliberately (see stack
-  table above). At real fleet scale (thousands of vehicles, millions of
-  trips/day) this would move to the same Spark cluster as the speed layer.
-- **Idle-vehicle alerting is per-micro-batch stateful logic in Python**
-  (read-then-write against `vehicle_state`), not Spark's built-in
-  `applyInPandasWithState`. Simpler to reason about and test at this
-  scale; would not scale past a single-partition bottleneck on
-  `vehicle_state` writes.
-- **No exactly-once guarantee end-to-end.** Postgres upserts make the sinks
-  idempotent under replay/retry, but a crash between Kafka commit and
-  Postgres write can still double-process a micro-batch's *effects* being
-  computed twice (harmless here since upserts overwrite, but would matter
-  for e.g. billing).
-- **Single-broker Kafka, single-node Postgres.** No replication; acceptable
-  for a 2-week class project, not for production availability.
-- **Vehicle roster and zone geography are synthetic** (`common/fleet_model.py`);
-  a real deployment would source these from a fleet-management system.
-- **Malformed-event injection is coarse** (~2% of events, three corruption
-  modes). Good enough to exercise the DLQ path; not a substitute for a
-  real schema-registry-enforced contract.
 
 ## Assumptions
 

@@ -205,7 +205,11 @@ services:
     command:
       - spark-submit
       - --master
-      - local[*]
+      - local[2]
+      - --driver-memory
+      - 768m
+      - --conf
+      - spark.ui.enabled=false
       - --packages
       - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
       - --conf
